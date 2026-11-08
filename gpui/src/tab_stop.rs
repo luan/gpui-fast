@@ -1,4 +1,3 @@
-// Modified by Longbridge for gpui-fast.
 use std::fmt::Debug;
 
 use ::sum_tree::SumTree;
@@ -8,49 +7,12 @@ use sum_tree::Bias;
 use crate::{FocusHandle, FocusId};
 
 /// Represents a collection of focus handles using the tab-index APIs.
-///
-/// A frame records its operations, which a frame drawn from it replays; the
-/// tab order is only worked out from them when focus moves by tab, not on
-/// every frame.
-#[derive(Debug, Default)]
-pub(crate) struct TabStopMap {
-    pub(crate) insertion_history: Vec<TabStopOperation>,
-    index: std::cell::OnceCell<TabStopIndex>,
-}
-
-/// The tab order of a [`TabStopMap`]'s operations.
 #[derive(Debug)]
-struct TabStopIndex {
+pub(crate) struct TabStopMap {
+    current_path: TabStopPath,
+    pub(crate) insertion_history: Vec<TabStopOperation>,
     by_id: FxHashMap<FocusId, TabStopNode>,
     order: SumTree<TabStopNode>,
-}
-
-impl TabStopIndex {
-    fn new(operations: &[TabStopOperation]) -> Self {
-        let mut current_path = TabStopPath::default();
-        let mut by_id = FxHashMap::default();
-        let mut order = SumTree::new(());
-        for (node_insertion_index, operation) in operations.iter().enumerate() {
-            match operation {
-                TabStopOperation::Insert(focus_handle) => {
-                    let mut path = current_path.clone();
-                    path.0.push(focus_handle.tab_index);
-                    let node = TabStopNode {
-                        node_insertion_index,
-                        tab_stop: focus_handle.tab_stop,
-                        path,
-                    };
-                    by_id.insert(focus_handle.id, node.clone());
-                    order.insert_or_replace(node, ());
-                }
-                TabStopOperation::Group(tab_index) => current_path.0.push(*tab_index),
-                TabStopOperation::GroupEnd => {
-                    current_path.0.pop();
-                }
-            }
-        }
-        Self { by_id, order }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -101,37 +63,54 @@ impl PartialOrd for TabStopNode {
     }
 }
 
+impl Default for TabStopMap {
+    fn default() -> Self {
+        Self {
+            current_path: TabStopPath::default(),
+            insertion_history: Vec::new(),
+            by_id: FxHashMap::default(),
+            order: SumTree::new(()),
+        }
+    }
+}
+
 impl TabStopMap {
-    fn push(&mut self, operation: TabStopOperation) {
-        self.insertion_history.push(operation);
-        self.index.take();
-    }
-
-    fn index(&self) -> &TabStopIndex {
-        self.index
-            .get_or_init(|| TabStopIndex::new(&self.insertion_history))
-    }
-
     pub fn insert(&mut self, focus_handle: &FocusHandle) {
-        self.push(TabStopOperation::Insert(focus_handle.clone()));
+        self.insertion_history
+            .push(TabStopOperation::Insert(focus_handle.clone()));
+        let mut path = self.current_path.clone();
+        path.0.push(focus_handle.tab_index);
+        let order = TabStopNode {
+            node_insertion_index: self.insertion_history.len() - 1,
+            tab_stop: focus_handle.tab_stop,
+            path,
+        };
+        self.by_id.insert(focus_handle.id, order.clone());
+        self.order.insert_or_replace(order, ());
     }
 
     pub fn begin_group(&mut self, tab_index: isize) {
-        self.push(TabStopOperation::Group(tab_index));
+        self.insertion_history
+            .push(TabStopOperation::Group(tab_index));
+        self.current_path.0.push(tab_index);
     }
 
     pub fn end_group(&mut self) {
-        self.push(TabStopOperation::GroupEnd);
+        self.insertion_history.push(TabStopOperation::GroupEnd);
+        self.current_path.0.pop();
     }
 
     pub fn clear(&mut self) {
+        *self = Self::default();
+        self.current_path.0.clear();
         self.insertion_history.clear();
-        self.index.take();
+        self.by_id.clear();
+        self.order = SumTree::new(());
     }
 
     pub fn next(&self, focused_id: Option<&FocusId>) -> Option<FocusHandle> {
         let Some(focused_id) = focused_id else {
-            let first = self.index().order.first()?;
+            let first = self.order.first()?;
             if first.tab_stop {
                 return self.focus_handle_for_order(first);
             } else {
@@ -154,7 +133,7 @@ impl TabStopMap {
     }
 
     fn next_inner(&self, node: &TabStopNode) -> Option<&TabStopNode> {
-        let mut cursor = self.index().order.cursor::<TabStopNode>(());
+        let mut cursor = self.order.cursor::<TabStopNode>(());
         cursor.seek(&node, Bias::Left);
         cursor.next();
         while let Some(item) = cursor.item()
@@ -168,7 +147,7 @@ impl TabStopMap {
 
     pub fn prev(&self, focused_id: Option<&FocusId>) -> Option<FocusHandle> {
         let Some(focused_id) = focused_id else {
-            let last = self.index().order.last()?;
+            let last = self.order.last()?;
             if last.tab_stop {
                 return self.focus_handle_for_order(last);
             } else {
@@ -191,7 +170,7 @@ impl TabStopMap {
     }
 
     fn prev_inner(&self, node: &TabStopNode) -> Option<&TabStopNode> {
-        let mut cursor = self.index().order.cursor::<TabStopNode>(());
+        let mut cursor = self.order.cursor::<TabStopNode>(());
         cursor.seek(&node, Bias::Left);
         cursor.prev();
         while let Some(item) = cursor.item()
@@ -204,8 +183,13 @@ impl TabStopMap {
     }
 
     pub fn replay(&mut self, nodes: &[TabStopOperation]) {
-        self.insertion_history.extend_from_slice(nodes);
-        self.index.take();
+        for node in nodes {
+            match node {
+                TabStopOperation::Insert(focus_handle) => self.insert(focus_handle),
+                TabStopOperation::Group(tab_index) => self.begin_group(*tab_index),
+                TabStopOperation::GroupEnd => self.end_group(),
+            }
+        }
     }
 
     pub fn paint_index(&self) -> usize {
@@ -213,11 +197,7 @@ impl TabStopMap {
     }
 
     pub(crate) fn tab_stop_count(&self) -> usize {
-        self.index()
-            .by_id
-            .values()
-            .filter(|node| node.tab_stop)
-            .count()
+        self.by_id.values().filter(|node| node.tab_stop).count()
     }
 
     fn focus_handle_for_order(&self, order: &TabStopNode) -> Option<FocusHandle> {
@@ -230,7 +210,7 @@ impl TabStopMap {
     }
 
     fn tab_node_for_focus_id(&self, focused_id: &FocusId) -> Option<&TabStopNode> {
-        let Some(order) = self.index().by_id.get(focused_id) else {
+        let Some(order) = self.by_id.get(focused_id) else {
             return None;
         };
         Some(order)

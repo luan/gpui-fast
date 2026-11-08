@@ -31,8 +31,8 @@ use crate::key_dispatch::{DispatchNodeId, DispatchTree};
 use crate::window::DeferredDraw;
 use crate::window::{PaintIndex, PrepaintStateIndex};
 use crate::{
-    AnyView, App, Bounds, ContentMask, ElementId, EntityId, FocusId, GlobalElementId, HitboxId, LayoutId,
-    Pixels, Point, StyleRefinement, View, ViewElement, Window,
+    AnyView, App, Bounds, ContentMask, ElementId, EntityId, FocusId, GlobalElementId, HitboxId,
+    LayoutId, Pixels, Point, StyleRefinement, View, ViewElement, Window,
 };
 use collections::FxHashSet;
 use smallvec::SmallVec;
@@ -530,7 +530,10 @@ impl Window {
         while index <= previous + record.nested {
             let nested = &records[index];
             if view_entity(&nested.id).is_some_and(|entity| self.dirty_views.contains(&entity)) {
-                if !nested.rebuild.as_ref().is_some_and(|rebuild| rebuild.is_cached())
+                if !nested
+                    .rebuild
+                    .as_ref()
+                    .is_some_and(|rebuild| rebuild.is_cached())
                     || !matches!(nested.paint, PaintStatus::Painted { .. })
                 {
                     return None;

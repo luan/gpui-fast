@@ -517,3 +517,28 @@ pub(crate) fn set_active_flag(a11y: &A11y, active: bool) {
 pub(crate) fn last_tree(window: &Window) -> Option<&accesskit::TreeUpdate> {
     window.a11y.debug.last_tree_update.as_ref()
 }
+
+/// `Window::debug_a11y_tree_json`. The tab stop count is the dumped frame's,
+/// counted here because ordering tab stops is too costly to do on every frame.
+pub(crate) fn debug_tree_json(window: &Window) -> Option<String> {
+    window
+        .a11y
+        .debug
+        .to_json(window.rendered_frame.tab_stops.tab_stop_count())
+}
+
+/// When a frame's tree was captured for the debug dump. A frame is captured on
+/// every draw while accessibility is active, so the time is formatted only
+/// when dumped.
+pub(crate) struct CapturedAt(std::time::SystemTime);
+
+impl CapturedAt {
+    pub(crate) fn now() -> Self {
+        Self(std::time::SystemTime::now())
+    }
+
+    pub(crate) fn to_rfc3339(&self) -> String {
+        chrono::DateTime::<chrono::Local>::from(self.0)
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, false)
+    }
+}

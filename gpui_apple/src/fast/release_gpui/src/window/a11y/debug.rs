@@ -18,8 +18,7 @@ pub(crate) struct FrameDebugInfo {
 }
 
 struct CapturedFrame {
-    /// Formatted only when dumped: a frame is captured on every draw.
-    rendered_at: std::time::SystemTime,
+    rendered_at: crate::fast::a11y::CapturedAt,
     frame_number: u64,
     window_title: Option<SharedString>,
     node_count: usize,
@@ -81,7 +80,7 @@ impl A11yDebug {
         self.last_active_descendant = active_descendant;
         self.frame_number += 1;
         self.last_frame = Some(CapturedFrame {
-            rendered_at: std::time::SystemTime::now(),
+            rendered_at: crate::fast::a11y::CapturedAt::now(),
             frame_number: self.frame_number,
             window_title: window_title.cloned(),
             node_count: update.nodes.len(),
@@ -97,8 +96,7 @@ impl A11yDebug {
 
     /// Serialize the last tree update to a readable JSON string. Node ids are
     /// replaced with short ephemeral ids (`a`, `b`, ..., `z`, `aa`, ...).
-    /// `tab_stop_count` is the dumped frame's, which is worked out only for a dump.
-    pub(crate) fn to_json(&self, tab_stop_count: usize) -> Option<String> {
+    pub(crate) fn to_json(&self, fast_tab_stop_count: usize) -> Option<String> {
         let update = self.last_tree_update.as_ref()?;
 
         let mut ephemeral: FxHashMap<NodeId, String> = FxHashMap::default();
@@ -133,12 +131,11 @@ impl A11yDebug {
 
         let frame = self.last_frame.as_ref().map(|frame| {
             serde_json::json!({
-                "rendered_at": chrono::DateTime::<chrono::Local>::from(frame.rendered_at)
-                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, false),
+                "rendered_at": crate::fast::a11y::CapturedAt::to_rfc3339(&frame.rendered_at),
                 "frame_number": frame.frame_number,
                 "window_title": frame.window_title.as_ref().map(|title| title.to_string()),
                 "node_count": frame.node_count,
-                "tab_stop_count": tab_stop_count,
+                "tab_stop_count": fast_tab_stop_count,
                 "viewport_size": {
                     "width": frame.viewport_size.width.0,
                     "height": frame.viewport_size.height.0,

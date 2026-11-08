@@ -2741,23 +2741,27 @@ fn a_spliced_view_forgets_the_entities_views_in_it_dropped() {
     assert_eq!(builds.get(), 21);
 }
 
-struct Cell2 {
+struct Swatch {
     red: bool,
     builds: Rc<Cell<usize>>,
 }
 
-impl Render for Cell2 {
+impl Render for Swatch {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         self.builds.set(self.builds.get() + 1);
         div()
             .size_full()
-            .bg(if self.red { crate::red() } else { crate::blue() })
+            .bg(if self.red {
+                crate::red()
+            } else {
+                crate::blue()
+            })
             .child(format!("cell {}", self.red))
     }
 }
 
 struct Panel {
-    cells: [Entity<Cell2>; 2],
+    cells: [Entity<Swatch>; 2],
     builds: Rc<Cell<usize>>,
 }
 
@@ -2803,7 +2807,7 @@ fn a_cached_view_is_drawn_around_a_notified_cached_view_in_it() {
         let panel_builds = panel_builds.clone();
         move |_, cx| Screen {
             panel: cx.new(|cx| Panel {
-                cells: cell_builds.map(|builds| cx.new(|_| Cell2 { red: false, builds })),
+                cells: cell_builds.map(|builds| cx.new(|_| Swatch { red: false, builds })),
                 builds: panel_builds,
             }),
         }
@@ -2817,22 +2821,36 @@ fn a_cached_view_is_drawn_around_a_notified_cached_view_in_it() {
     };
     draw(&mut cx);
     let first = window
-        .update(&mut cx, |screen, _, cx| screen.panel.read(cx).cells[0].clone())
+        .update(&mut cx, |screen, _, cx| {
+            screen.panel.read(cx).cells[0].clone()
+        })
         .unwrap();
     for red in [true, false, true] {
-        let before = (panel_builds.get(), cell_builds[0].get(), cell_builds[1].get());
+        let before = (
+            panel_builds.get(),
+            cell_builds[0].get(),
+            cell_builds[1].get(),
+        );
         first.update(&mut cx, |cell, cx| {
             cell.red = red;
             cx.notify();
         });
         let spliced = draw(&mut cx);
         assert_eq!(
-            (panel_builds.get(), cell_builds[0].get(), cell_builds[1].get()),
+            (
+                panel_builds.get(),
+                cell_builds[0].get(),
+                cell_builds[1].get()
+            ),
             (before.0, before.1 + 1, before.2),
             "only the notified cell is built again"
         );
         cx.update_window(window.into(), |_, window, _| window.refresh())
             .unwrap();
-        assert_eq!(draw(&mut cx), spliced, "the spliced frame is what a full redraw draws");
+        assert_eq!(
+            draw(&mut cx),
+            spliced,
+            "the spliced frame is what a full redraw draws"
+        );
     }
 }

@@ -7364,8 +7364,7 @@ impl Window {
 
     /// Debug representation of the last frame's accessibility information.
     pub fn debug_a11y_tree_json(&self) -> Option<String> {
-        self.a11y
-            .debug_tree_json(self.rendered_frame.tab_stops.tab_stop_count())
+        crate::fast::a11y::debug_tree_json(self)
     }
 
     /// Register a listener for an accessibility action on a specific node.

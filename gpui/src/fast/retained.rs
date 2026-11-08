@@ -1881,9 +1881,6 @@ fn end_view_profile<V: View>(
     }
 }
 
-/// Prepaints the view as [`crate::Element::prepaint`] does, following up on how
-/// [`request_view_layout`] laid it out.
-#[inline(always)]
 /// The layout of a cached view laid out as it was, at the style node it had,
 /// for a cached view built again inside a view drawn from last frame.
 pub(crate) fn cached_layout_state(
@@ -1895,6 +1892,9 @@ pub(crate) fn cached_layout_state(
     })
 }
 
+/// Prepaints the view as [`crate::Element::prepaint`] does, following up on how
+/// [`request_view_layout`] laid it out.
+#[inline(always)]
 pub(crate) fn prepaint_view<V: View>(
     view: &mut ViewElement<V>,
     global_id: Option<&GlobalElementId>,

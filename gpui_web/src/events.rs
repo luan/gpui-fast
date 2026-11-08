@@ -480,7 +480,7 @@ impl WebWindowInner {
     }
 
     /// See [`ImeMirror::schedule_sync`].
-    fn schedule_ime_mirror_sync(self: &Rc<Self>) {
+    pub(crate) fn schedule_ime_mirror_sync(self: &Rc<Self>) {
         ImeMirror::schedule_sync(self);
     }
 
@@ -739,6 +739,10 @@ impl WebWindowInner {
                 return;
             }
 
+            if crate::fast::ime_keys::belongs_to_ime(&this, &event) {
+                return;
+            }
+
             let keystroke = Keystroke {
                 modifiers,
                 key,
@@ -757,11 +761,6 @@ impl WebWindowInner {
                     this.schedule_ime_mirror_sync();
                     return;
                 }
-            }
-
-            if this.is_composing.get() || event.is_composing() {
-                event.prevent_default();
-                return;
             }
 
             if keystroke_inserts_text(&modifiers, this.is_mac)
@@ -892,6 +891,8 @@ impl WebWindowInner {
                 .count()
                 .min(old_units.len() - suffix_length)
                 .min(new_units.len() - suffix_length);
+            let (prefix_length, suffix_length) =
+                crate::fast::ime_edit::whole_code_points(&new_units, prefix_length, suffix_length);
 
             let inserted_text = String::from_utf16_lossy(
                 &new_units[prefix_length..new_units.len() - suffix_length],
