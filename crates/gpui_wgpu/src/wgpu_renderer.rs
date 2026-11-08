@@ -232,7 +232,7 @@ pub(crate) struct WgpuRendererCore {
 
 /// GPU resources of a windowed renderer. A surface is only ever configured against the
 /// device that owns `core`, so it cannot outlive it: there is no surface-only state.
-enum RendererState {
+pub(crate) enum RendererState {
     /// Frames can be drawn.
     Ready {
         surface: wgpu::Surface<'static>,
@@ -253,7 +253,8 @@ pub struct WgpuRenderer {
     /// Compositor GPU hint for adapter selection (unused on WASM).
     #[allow(dead_code)]
     pub(crate) compositor_gpu: Option<CompositorGpuHint>,
-    state: RendererState,
+    pub(crate) fast_acquired: crate::fast::acquire::AcquiredTexture,
+    pub(crate) state: RendererState,
     surface_config: wgpu::SurfaceConfiguration,
     pub(crate) atlas: Arc<WgpuAtlas>,
     transparent_alpha_mode: wgpu::CompositeAlphaMode,
@@ -518,6 +519,7 @@ impl WgpuRenderer {
             observed_error_generation: 0,
             last_surface_error: None,
             needs_redraw: false,
+            fast_acquired: crate::fast::acquire::AcquiredTexture::default(),
         })
     }
 }
@@ -1035,6 +1037,7 @@ impl WgpuRenderer {
         if width == self.surface_config.width && height == self.surface_config.height {
             return;
         }
+        crate::fast::acquire::release(&mut self.fast_acquired);
 
         let clamped_width = width.min(self.max_texture_size);
         let clamped_height = height.min(self.max_texture_size);
@@ -1096,6 +1099,7 @@ impl WgpuRenderer {
         if new_alpha_mode == self.surface_config.alpha_mode {
             return;
         }
+        crate::fast::acquire::release(&mut self.fast_acquired);
         self.surface_config.alpha_mode = new_alpha_mode;
         let format = self.surface_config.format;
 
@@ -1196,7 +1200,7 @@ impl WgpuRenderer {
             self.failed_frame_count = 0;
         }
 
-        let frame = match surface.get_current_texture() {
+        let frame = match crate::fast::acquire::current_texture(&mut self.fast_acquired, surface) {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
                 // Textures must be destroyed before the surface can be reconfigured.
@@ -2144,6 +2148,7 @@ impl WgpuRenderer {
     /// (e.g. Android `TerminateWindow`) but you intend to re-create the
     /// surface later without losing cached atlas textures.
     pub fn unconfigure_surface(&mut self) {
+        crate::fast::acquire::release(&mut self.fast_acquired);
         self.state = match std::mem::replace(&mut self.state, RendererState::Released) {
             RendererState::Ready { core, surface } => {
                 drop(surface);
@@ -2172,6 +2177,7 @@ impl WgpuRenderer {
         config: WgpuSurfaceConfig,
         instance: &wgpu::Instance,
     ) -> anyhow::Result<()> {
+        crate::fast::acquire::release(&mut self.fast_acquired);
         let window_handle = window
             .window_handle()
             .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
@@ -2215,6 +2221,7 @@ impl WgpuRenderer {
     }
 
     pub fn destroy(&mut self) {
+        crate::fast::acquire::release(&mut self.fast_acquired);
         // Release surface-bound GPU resources eagerly so the underlying native
         // window can be destroyed before the renderer itself is dropped.
         self.state = RendererState::Released;
@@ -2243,6 +2250,7 @@ impl WgpuRenderer {
     where
         W: HasWindowHandle + HasDisplayHandle + std::fmt::Debug + Send + Sync + Clone + 'static,
     {
+        crate::fast::acquire::release(&mut self.fast_acquired);
         let gpu_context = self.context.as_ref().expect("recover requires gpu_context");
 
         // Check if another window already recovered the context

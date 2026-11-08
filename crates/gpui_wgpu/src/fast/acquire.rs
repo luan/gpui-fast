@@ -1,0 +1,53 @@
+//! Acquiring the surface texture before the frame is built.
+//!
+//! `draw` asks the surface for a texture once the scene is ready, and waits
+//! there while the compositor holds every drawable. The frame it then
+//! presents was built before the wait. A host that calls
+//! `WgpuRenderer::acquire_surface_texture` before building the frame waits
+//! first instead, so the presented frame shows the state after the wait.
+
+use crate::WgpuRenderer;
+use crate::wgpu_renderer::RendererState;
+
+/// What acquiring the surface texture before `draw` returned; `draw` presents
+/// into the texture or handles the failure, as if it had acquired it itself.
+/// `WgpuRenderer` declares it before its `state`, so that a held texture drops
+/// before its surface.
+#[derive(Default)]
+pub(crate) struct AcquiredTexture(Option<wgpu::CurrentSurfaceTexture>);
+
+impl WgpuRenderer {
+    /// Acquires the next surface texture now rather than in `draw`, so that
+    /// waiting for one happens before the frame is built. The next `draw`
+    /// presents into it, or handles a failed acquisition as it would have on
+    /// its own, without waiting again. Returns whether a texture is held.
+    pub fn acquire_surface_texture(&mut self) -> bool {
+        if self.fast_acquired.0.is_none()
+            && let RendererState::Ready { surface, .. } = &self.state
+        {
+            self.fast_acquired.0 = Some(surface.get_current_texture());
+        }
+        matches!(
+            self.fast_acquired.0,
+            Some(wgpu::CurrentSurfaceTexture::Success(_))
+        )
+    }
+}
+
+/// The texture `draw` presents into: the one acquired ahead of it, or the
+/// surface's next.
+pub(crate) fn current_texture(
+    acquired: &mut AcquiredTexture,
+    surface: &wgpu::Surface,
+) -> wgpu::CurrentSurfaceTexture {
+    acquired
+        .0
+        .take()
+        .unwrap_or_else(|| surface.get_current_texture())
+}
+
+/// Drops a held texture, which has to happen before its surface is
+/// reconfigured, replaced or released.
+pub(crate) fn release(acquired: &mut AcquiredTexture) {
+    acquired.0 = None;
+}

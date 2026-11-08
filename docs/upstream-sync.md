@@ -212,6 +212,12 @@ release, and leave is sent when the pointer changes recipients. Prepaint scopes
 and retained context keep input ownership with the same surface as its paint.
 No application-specific timeline policy belongs here.
 
+- `WgpuRenderer::acquire_surface_texture` (`fast::acquire`). Upstream's
+  `draw` acquires the surface texture after the frame is built, so when the
+  compositor holds every drawable (no vsync), the wait comes after the work
+  and the presented frame is older than the wait. A host that drives a
+  `WgpuRenderer` itself calls this before building the frame, and `draw`
+  presents into the texture it holds. Without the call, `draw` is upstream's.
 - Dynamic textures (longbridge/gpui-fast#86), ours to change until upstream
   takes them:
   `gpui` exports `DynamicTexture`, `DynamicTextureId`,
