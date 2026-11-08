@@ -518,13 +518,19 @@ pub(crate) fn last_tree(window: &Window) -> Option<&accesskit::TreeUpdate> {
     window.a11y.debug.last_tree_update.as_ref()
 }
 
-/// `Window::debug_a11y_tree_json`. The tab stop count is the dumped frame's,
-/// counted here because ordering tab stops is too costly to do on every frame.
+/// `Window::debug_a11y_tree_json`. Counting tab stops orders them, too costly
+/// to do for every captured frame, so the dump counts them: those of the frame
+/// on screen when its tree is the captured one, none otherwise.
 pub(crate) fn debug_tree_json(window: &Window) -> Option<String> {
-    window
+    // Until the next draw starts, the log records only if the last draw
+    // captured a tree.
+    let tab_stop_count = window
         .a11y
-        .debug
-        .to_json(window.rendered_frame.tab_stops.tab_stop_count())
+        .nodes
+        .fast
+        .recording
+        .then(|| window.rendered_frame.tab_stops.tab_stop_count());
+    window.a11y.debug.to_json(tab_stop_count)
 }
 
 /// When a frame's tree was captured for the debug dump. A frame is captured on

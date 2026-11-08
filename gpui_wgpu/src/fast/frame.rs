@@ -1108,3 +1108,6 @@ fn rasterize_group(
     );
     true
 }
+
+#[cfg(all(test, feature = "test-support", not(target_family = "wasm")))]
+mod tests;

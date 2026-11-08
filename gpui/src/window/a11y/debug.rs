@@ -96,7 +96,7 @@ impl A11yDebug {
 
     /// Serialize the last tree update to a readable JSON string. Node ids are
     /// replaced with short ephemeral ids (`a`, `b`, ..., `z`, `aa`, ...).
-    pub(crate) fn to_json(&self, fast_tab_stop_count: usize) -> Option<String> {
+    pub(crate) fn to_json(&self, fast_tab_stop_count: Option<usize>) -> Option<String> {
         let update = self.last_tree_update.as_ref()?;
 
         let mut ephemeral: FxHashMap<NodeId, String> = FxHashMap::default();
