@@ -10,22 +10,28 @@
 use crate::WgpuRenderer;
 use crate::wgpu_renderer::RendererState;
 
-/// A surface texture acquired before `draw`, which presents into it.
+/// What acquiring the surface texture before `draw` returned; `draw` presents
+/// into the texture or handles the failure, as if it had acquired it itself.
+/// `WgpuRenderer` declares it before its `state`, so that a held texture drops
+/// before its surface.
 #[derive(Default)]
-pub(crate) struct AcquiredTexture(Option<wgpu::SurfaceTexture>);
+pub(crate) struct AcquiredTexture(Option<wgpu::CurrentSurfaceTexture>);
 
 impl WgpuRenderer {
     /// Acquires the next surface texture now rather than in `draw`, so that
-    /// waiting for one happens before the frame is built. `draw` presents into
-    /// the held texture. Returns whether a texture is held.
+    /// waiting for one happens before the frame is built. The next `draw`
+    /// presents into it, or handles a failed acquisition as it would have on
+    /// its own, without waiting again. Returns whether a texture is held.
     pub fn acquire_surface_texture(&mut self) -> bool {
         if self.fast_acquired.0.is_none()
             && let RendererState::Ready { surface, .. } = &self.state
-            && let wgpu::CurrentSurfaceTexture::Success(texture) = surface.get_current_texture()
         {
-            self.fast_acquired.0 = Some(texture);
+            self.fast_acquired.0 = Some(surface.get_current_texture());
         }
-        self.fast_acquired.0.is_some()
+        matches!(
+            self.fast_acquired.0,
+            Some(wgpu::CurrentSurfaceTexture::Success(_))
+        )
     }
 }
 
@@ -35,10 +41,10 @@ pub(crate) fn current_texture(
     acquired: &mut AcquiredTexture,
     surface: &wgpu::Surface,
 ) -> wgpu::CurrentSurfaceTexture {
-    acquired.0.take().map_or_else(
-        || surface.get_current_texture(),
-        wgpu::CurrentSurfaceTexture::Success,
-    )
+    acquired
+        .0
+        .take()
+        .unwrap_or_else(|| surface.get_current_texture())
 }
 
 /// Drops a held texture, which has to happen before its surface is

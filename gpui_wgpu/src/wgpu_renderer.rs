@@ -255,7 +255,6 @@ pub struct WgpuRenderer {
     /// Compositor GPU hint for adapter selection (unused on WASM).
     #[allow(dead_code)]
     pub(crate) compositor_gpu: Option<CompositorGpuHint>,
-    // Declared before `state` so that a held texture drops before its surface.
     pub(crate) fast_acquired: crate::fast::acquire::AcquiredTexture,
     pub(crate) state: RendererState,
     surface_config: wgpu::SurfaceConfiguration,
