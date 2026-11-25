@@ -1,3 +1,4 @@
+// Modified by Longbridge for gpui-fast.
 use anyhow::{Context as _, Ok, Result};
 use collections::HashMap;
 use cosmic_text::{
@@ -21,7 +22,7 @@ use swash::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-pub struct CosmicTextSystem(RwLock<CosmicTextSystemState>);
+pub struct CosmicTextSystem(pub(crate) RwLock<CosmicTextSystemState>); // crate::fast::synthetic_italic's tests read the state
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FontKey {
@@ -46,14 +47,15 @@ struct LoadedFontKey {
     font: FontKey,
 }
 
-struct CosmicTextSystemState {
-    font_system: FontSystem,
+pub(crate) struct CosmicTextSystemState {
+    pub(crate) font_system: FontSystem,
     scratch: ShapeBuffer,
     swash_scale_context: ScaleContext,
     pending_glyph_images: HashMap<RenderGlyphParams, swash::scale::image::Image>,
     /// Contains all already loaded fonts, including all faces. Indexed by `FontId`.
-    loaded_fonts: Vec<LoadedFont>,
+    pub(crate) loaded_fonts: Vec<LoadedFont>,
     loaded_font_ids_by_key: HashMap<LoadedFontKey, FontId>,
+    pub(crate) synthetic_italic: crate::fast::synthetic_italic::Twins,
     /// Caches the `FontId`s associated with a specific family to avoid iterating the font database
     /// for every font face in a family.
     font_ids_by_family_cache: HashMap<FontKey, SmallVec<[FontId; 4]>>,
@@ -61,10 +63,11 @@ struct CosmicTextSystemState {
     missing_glyph_sink: Option<Arc<dyn MissingGlyphSink>>,
 }
 
-struct LoadedFont {
-    font: Arc<CosmicTextFont>,
+#[derive(Clone)] // crate::fast::synthetic_italic clones a face for its italic twin
+pub(crate) struct LoadedFont {
+    pub(crate) font: Arc<CosmicTextFont>,
     features: CosmicFontFeatures,
-    is_known_emoji_font: bool,
+    pub(crate) is_known_emoji_font: bool,
     /// resolved at load time so `layout_line` shares one chain across faces.
     /// `Arc` keeps clone cheap on the per-run hot path.
     user_fallback_chain: Arc<[(FontId, SharedString)]>,
@@ -138,6 +141,7 @@ impl CosmicTextSystem {
             pending_glyph_images: HashMap::default(),
             loaded_fonts: Vec::new(),
             loaded_font_ids_by_key: HashMap::default(),
+            synthetic_italic: crate::fast::synthetic_italic::Twins::default(),
             font_ids_by_family_cache: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
             missing_glyph_sink: None,
@@ -157,6 +161,7 @@ impl CosmicTextSystem {
             pending_glyph_images: HashMap::default(),
             loaded_fonts: Vec::new(),
             loaded_font_ids_by_key: HashMap::default(),
+            synthetic_italic: crate::fast::synthetic_italic::Twins::default(),
             font_ids_by_family_cache: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
             missing_glyph_sink: None,
@@ -204,8 +209,10 @@ impl PlatformTextSystem for CosmicTextSystem {
         };
 
         let ix = find_best_match(font, candidates, &state)?;
-
-        Ok(candidates[ix])
+        let font_id = candidates[ix];
+        Ok(crate::fast::synthetic_italic::for_request(
+            &mut state, font_id, font.style,
+        ))
     }
 
     fn prewarm_fonts(&self, font_ids: &[FontId]) {
@@ -302,7 +309,11 @@ impl CosmicTextSystemState {
         Some(FontMatchProperties {
             primary_family_name: first_family.0.clone().into(),
             stretch: face.stretch,
-            style: face.style,
+            style: crate::fast::synthetic_italic::style(
+                &self.synthetic_italic,
+                font_id,
+                face.style,
+            ),
             weight: face.weight,
             features: loaded_font.features.clone(),
             fallback_chain: Arc::clone(&loaded_font.user_fallback_chain),
@@ -364,8 +375,7 @@ impl CosmicTextSystemState {
                         cached.clone()
                     } else {
                         let loaded = self.load_family(fallback_name, features, None)?;
-                        self.font_ids_by_family_cache
-                            .insert(fb_key.clone(), loaded.clone());
+                        self.font_ids_by_family_cache.insert(fb_key, loaded.clone());
                         loaded
                     };
                     let Some(&fb_id) = fb_ids.first() else {
@@ -428,6 +438,7 @@ impl CosmicTextSystemState {
             // glyph.
             if font.as_swash().charmap().map('m') == 0
                 && !allowed_bad_font_names.contains(&postscript_name.as_str())
+                && !crate::fast::emoji_fonts::may_load_without_m(&postscript_name)
             {
                 continue;
             };
@@ -540,6 +551,8 @@ impl CosmicTextSystemState {
             &[Source::Bitmap(StrikeWith::ExactSize), Source::Outline]
         };
 
+        let sources =
+            crate::fast::synthetic_italic::sources(&self.synthetic_italic, params, sources);
         let mut renderer = Render::new(sources);
         if params.subpixel_rendering {
             // There seems to be a bug in Swash where the B and R values are swapped.
@@ -549,6 +562,7 @@ impl CosmicTextSystemState {
         } else {
             renderer.format(Format::Alpha).offset(subpixel_offset);
         }
+        crate::fast::synthetic_italic::slant(&self.synthetic_italic, params, &mut renderer);
 
         let glyph_id: u16 = params.glyph_id.0.try_into()?;
         renderer
@@ -795,7 +809,8 @@ impl CosmicTextSystemState {
             if loaded_font.font.id() != glyph.font_id {
                 match self.font_id_for_cosmic_id(glyph.font_id) {
                     std::result::Result::Ok(resolved_id) => {
-                        font_id = resolved_id;
+                        font_id =
+                            crate::fast::synthetic_italic::for_fallback(self, font_id, resolved_id);
                         loaded_font = self.loaded_font(font_id);
                     }
                     Err(error) => {
@@ -816,7 +831,10 @@ impl CosmicTextSystemState {
 
             let shaped_glyph = ShapedGlyph {
                 id: GlyphId(glyph.glyph_id as u32),
-                position: point(glyph.x.into(), glyph.y.into()),
+                position: point(
+                    (glyph.x + glyph.x_offset * f32::from(font_size)).into(),
+                    (glyph.y - glyph.y_offset * f32::from(font_size)).into(),
+                ),
                 index: glyph.start,
                 is_emoji,
             };
@@ -1199,7 +1217,7 @@ fn face_info_into_properties(
     }
 }
 
-fn check_is_known_emoji_font(postscript_name: &str) -> bool {
+pub(crate) fn check_is_known_emoji_font(postscript_name: &str) -> bool {
     // TODO: Include other common emoji fonts
     postscript_name == "NotoColorEmoji"
 }
@@ -1351,7 +1369,10 @@ mod tests {
                 ..regular.clone()
             };
             let font_id = text_system.font_id(&requested)?;
-            assert_eq!(font_id, regular_id);
+            // An italic request gets crate::fast::synthetic_italic's slanted twin.
+            let twins = &text_system.0.read().synthetic_italic;
+            assert_eq!(twins.is_twin(font_id), style != gpui::FontStyle::Normal);
+            assert_eq!(twins.base(font_id), regular_id);
             assert_eq!(
                 text_system.font_weight_and_style(font_id)?,
                 (gpui::FontWeight::NORMAL, gpui::FontStyle::Normal)
@@ -1367,6 +1388,29 @@ mod tests {
             font_id,
         }];
         Ok(text_system.layout_line(text, gpui::px(14.0), &runs))
+    }
+
+    #[test]
+    fn combining_marks_are_positioned_over_their_base() -> Result<()> {
+        let text_system = text_system()?;
+        let layout = layout_text(&text_system, "v\u{0304}v")?;
+        let glyphs = layout
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter())
+            .collect::<Vec<_>>();
+        assert_eq!(glyphs.len(), 3);
+        let base = glyphs[0].position;
+        let mark = glyphs[1].position;
+        let next = glyphs[2].position;
+        assert!(mark.x > base.x);
+        assert!(
+            mark.x < next.x,
+            "combining mark positioned after its base: mark.x={:?}, next.x={:?}",
+            mark.x,
+            next.x
+        );
+        Ok(())
     }
 
     /// Mirrors the original crash: mixed-direction text reaching the shaper

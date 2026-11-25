@@ -3,6 +3,7 @@
 //! carried from one frame to the next, and shaping statistics.
 
 use crate::fast::layout::Adopted;
+use crate::fast::truncation::{self, Room};
 use crate::{
     App, AvailableSpace, Bounds, DecorationRun, FontRun, FrameCache, Hsla, LayoutId, LineLayout,
     LineLayoutCache, LineLayoutIndex, Pixels, PlatformTextSystem, SharedString, Size,
@@ -442,13 +443,27 @@ fn measure_text(
         if let Some(max_lines) = text_style.line_clamp
             && let Some(wrap_width) = wrap_width
         {
-            line_wrapper.truncate_wrapped_line(
+            let truncated = line_wrapper.truncate_wrapped_line(
                 text.clone(),
                 wrap_width,
                 max_lines,
                 &truncation_affix,
                 runs,
                 truncate_from,
+            );
+            let room = Room::Lines {
+                wrap_width,
+                max_lines: max_lines.max(1),
+            };
+            truncation::fit(
+                text,
+                runs,
+                truncated,
+                &truncation_affix,
+                truncate_from,
+                room,
+                font_size,
+                window,
             )
         } else if let Some(unclipped) = window
             .text_system()
@@ -458,16 +473,28 @@ fn measure_text(
                 .iter()
                 .all(|line| line.size(line_height).width <= truncate_width)
         {
-            // Truncation sums per-character advances, which overestimates the
-            // shaped width, so text that fits once shaped is not truncated.
+            // Truncation sums per-character advances, which can be more than
+            // the shaped width, so text that fits once shaped is not truncated.
             (text.clone(), Cow::Borrowed(runs))
         } else {
-            line_wrapper.truncate_line(
+            // The sum can also be less than the shaped width, so what it cuts
+            // is fitted to the shaped width.
+            let truncated = line_wrapper.truncate_line(
                 text.clone(),
                 truncate_width,
                 &truncation_affix,
                 runs,
                 truncate_from,
+            );
+            truncation::fit(
+                text,
+                runs,
+                truncated,
+                &truncation_affix,
+                truncate_from,
+                Room::Line(truncate_width),
+                font_size,
+                window,
             )
         }
     } else {
@@ -1229,4 +1256,51 @@ mod tests {
         })
         .unwrap();
     }
+}
+
+/// The bounds a line painted at `origin` covers, its wrapped rows aligned:
+/// the bounds `Window::paint_layer` is given for the line's layer.
+pub(crate) fn line_paint_bounds(
+    origin: crate::Point<crate::Pixels>,
+    layout: &crate::LineLayout,
+    line_height: crate::Pixels,
+    align: crate::TextAlign,
+    align_width: Option<crate::Pixels>,
+    wrap_boundaries: &[crate::WrapBoundary],
+) -> crate::Bounds<crate::Pixels> {
+    let mut bounds = crate::Bounds::new(
+        origin,
+        crate::size(
+            layout.width,
+            line_height * (wrap_boundaries.len() as f32 + 1.),
+        ),
+    );
+    if align == crate::TextAlign::Left || layout.len == 0 {
+        return bounds;
+    }
+
+    let align_width = align_width.unwrap_or(layout.width);
+    let mut row_start = crate::Pixels::ZERO;
+    let row_ends = wrap_boundaries
+        .iter()
+        .map(|boundary| {
+            layout.runs[boundary.run_ix].glyphs[boundary.glyph_ix]
+                .position
+                .x
+        })
+        .chain([layout.width]);
+    for (row, row_end) in row_ends.enumerate() {
+        let width = row_end - row_start;
+        let offset = match align {
+            crate::TextAlign::Left => crate::Pixels::ZERO,
+            crate::TextAlign::Center => (align_width - width) / 2.,
+            crate::TextAlign::Right => align_width - width,
+        };
+        bounds = bounds.union(&crate::Bounds::new(
+            crate::point(origin.x + offset, origin.y + line_height * row as f32),
+            crate::size(width, line_height),
+        ));
+        row_start = row_end;
+    }
+    bounds
 }

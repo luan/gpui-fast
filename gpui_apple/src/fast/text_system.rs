@@ -16,7 +16,13 @@ pub(crate) struct SizedFonts(HashMap<(FontId, u32), CTFont>);
 impl SizedFonts {
     /// The native font for `font`, whose id is `font_id`, at `font_size`, made
     /// once and kept.
-    pub(crate) fn get(&mut self, font_id: FontId, font: &FontKitFont, font_size: Pixels) -> CTFont {
+    pub(crate) fn get(
+        &mut self,
+        font_id: FontId,
+        font: &FontKitFont,
+        font_size: Pixels,
+        italic: bool,
+    ) -> CTFont {
         // Sizes can animate, and every size a font is drawn at would otherwise
         // be kept for good.
         const MAX_SIZED_FONTS: usize = 1024;
@@ -27,11 +33,25 @@ impl SizedFonts {
         if self.0.len() >= MAX_SIZED_FONTS {
             self.0.clear();
         }
-        let font = font
-            .native_font()
-            .clone_with_font_size(f32::from(font_size).into());
+        let font = super::synthetic_italic::sized(font, f32::from(font_size).into(), italic);
         self.0.insert(key, font.clone());
         font
+    }
+}
+
+/// A glyph drawn at dilation 0 is smoothed only when the user allows smoothing.
+///
+/// `glyph_dilation_for_color` gives 0 both for dark text and when
+/// `AppleFontSmoothing` is 0, but CoreGraphics' own smoothing flag defaults to
+/// on and CoreGraphics reads only the persistent value of the preference: an
+/// app that turns smoothing off for itself (a launch argument, the argument
+/// domain) still got every dark glyph dilated, 10–22 % more ink than the same
+/// glyph with smoothing off. With smoothing allowed this keeps CoreGraphics'
+/// default, so the usual look does not change.
+#[cfg(target_os = "macos")]
+pub(crate) fn smooth_undilated(cx: &core_graphics::context::CGContext, allowed: bool) {
+    if !allowed {
+        cx.set_should_smooth_fonts(false);
     }
 }
 

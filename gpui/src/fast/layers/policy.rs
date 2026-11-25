@@ -13,15 +13,17 @@
 //! exceed the budget. Content holding what a layer cannot composite otherwise
 //! (spec §6.5) keeps the container on today's path only while it does: the
 //! layer is dropped and painted again a few frames later, to see whether it
-//! still does. Layers are dropped when the window is resized or rescaled,
-//! and when they have not been composited for long.
+//! still does, and twice as long after each time it does. Layers are dropped
+//! when the window is resized or rescaled, and when they have not been
+//! composited for long.
 
 use crate::fast::layers::invalidate::OwnerWatch;
 use crate::fast::layers::record::LayerRecord;
 use crate::fast::layers::work::WorkBudget;
 use crate::fast::layers::{Layer, WindowLayers, input, invalidate, lists, scene::LayerKey};
 use crate::{
-    App, Bounds, ContentMask, EntityId, GlobalElementId, Pixels, Point, Size, TextStyle, Window,
+    App, Bounds, ContentMask, EntityId, FocusId, GlobalElementId, Pixels, Point, Size, TextStyle,
+    Window,
 };
 
 /// What a scroll container does with its content this frame.
@@ -42,13 +44,24 @@ const PROMOTE_AFTER_SCROLLED_FRAMES: u8 = 2;
 /// A layer whose content changed on at least this many of the last 16
 /// frames is demoted. Include the halfway boundary at 120 Hz.
 const DEMOTE_AFTER_CHANGED_FRAMES: u32 = 8;
+/// A list's layer whose content changed on at least this many of the last 16
+/// frames is demoted. A list changing on every other frame, as a feed of 60
+/// updates a second does at 120 Hz, composites the frames between and keeps
+/// its layer; one changing on every frame, as a list following its tail or
+/// moving its selection does, composites none, and painting its rows afresh
+/// costs more than drawing them without the layer (see
+/// [`crate::fast::layers::work::REPAINT_COST`]).
+const LIST_DEMOTE_AFTER_CHANGED_FRAMES: u32 = 14;
 /// How many frames a demoted container's content must be stable for before
 /// it may get a layer again.
 const REPROMOTE_AFTER_STABLE_FRAMES: u64 = 60;
 /// Repeatedly unprofitable caches wait longer, up to this many doublings.
 const MAX_COOLDOWN_DOUBLINGS: u8 = 5;
 /// How many frames a container whose content held what a layer cannot
-/// composite waits before its content is painted into a layer again.
+/// composite waits before its content is painted into a layer again. Only
+/// painting it tells whether it still holds it, and a repaint that finds it
+/// does is paid for nothing: the wait doubles each time, up to
+/// [`MAX_COOLDOWN_DOUBLINGS`] times, until the layer is composited.
 const RETRY_AFTER_INELIGIBLE_FRAMES: u64 = 8;
 /// A layer not composited for this many frames is dropped.
 const DROP_AFTER_FRAMES: u64 = 120;
@@ -75,6 +88,12 @@ pub(crate) struct LayerPolicy {
     /// After its content held what a layer cannot composite, the first frame
     /// the container may get a layer again.
     retry_at: Option<u64>,
+    /// How many times in a row its content, painted into a layer, held what
+    /// a layer cannot composite.
+    retry_doublings: u8,
+    /// The focus the window had when its content last handled text input:
+    /// once the focus has moved, the input no longer keeps it off its layer.
+    retry_focus: Option<FocusId>,
     /// The last frame the container scrolled on.
     last_scrolled_frame: Option<u64>,
     /// The last frame the container was looked at.
@@ -93,6 +112,16 @@ pub(crate) struct LayerPolicy {
     /// Whether the content, as last painted into the layer, prepainted an
     /// anchored element.
     content_anchored: bool,
+    /// How many surfaces the window had placed when the container was last
+    /// looked at, before its content was prepainted. See
+    /// [`note_surfaces_placed`].
+    surfaces_placed: u64,
+    /// Whether the content, last prepainted without a layer, placed a
+    /// native or external GPU surface. A layer is not tried while it does:
+    /// the frame trying it prepaints the content under the layer's wider
+    /// mask, which a web view takes for its clip and would show outside the
+    /// container for that frame. See [`note_surfaces_without_layer`].
+    surfaces_without_layer: bool,
     /// Recent rebuilding work, relative to drawing the visible content.
     work: WorkBudget,
     /// Backoff survives dropping the record and its cached rows.
@@ -213,11 +242,13 @@ pub(crate) fn decide(
         1
     };
     // A list's layer replays its rows (see
-    // [`crate::fast::layers::paint::replays`]): it costs no more than drawing
-    // them without it, so it is not demoted for what it costs or for changing
-    // often, and has no tiles to keep within budget.
+    // [`crate::fast::layers::paint::replays`]): a frame that keeps them costs
+    // no more than drawing the list without it, so it is not demoted for its
+    // estimated work, and has no tiles to keep within budget. It is demoted
+    // for content that changes on nearly every frame (see
+    // [`LIST_DEMOTE_AFTER_CHANGED_FRAMES`]).
     let replayed = layer.rows.list;
-    let mut demoted_until = if replayed { None } else { policy.demoted_until };
+    let mut demoted_until = policy.demoted_until;
     let changed_while_demoted =
         demoted_until.is_some() && invalidate::changed_without_layer(window, cx, id);
     if changed_while_demoted {
@@ -230,6 +261,11 @@ pub(crate) fn decide(
     if demoted_until.is_some_and(|until| frame >= until) {
         demoted_until = None;
     }
+    // The focus left the input that kept the content off its layer: the
+    // wait to paint it into one again is over.
+    let focus = window.focus;
+    let unfocused = policy.retry_focus.is_some_and(|input| focus != Some(input));
+    let retry_at = if unfocused { None } else { policy.retry_at };
 
     // Whether the content changed this frame, whether the layer is demoted
     // for it, and whether it is dropped for holding what it cannot
@@ -238,6 +274,7 @@ pub(crate) fn decide(
     let mut rerendered = false;
     let mut demote = layer.record.is_some() && !replayed && policy.work.over_budget();
     let mut ineligible = false;
+    let mut handles_input = false;
     let mut owner_animating = false;
     let decision = match &layer.record {
         _ if demoted_until.is_some() => Decision::Bypass,
@@ -252,6 +289,8 @@ pub(crate) fn decide(
         }
         Some(record) if !eligible(window, id, policy, record) => {
             ineligible = true;
+            let paint = &record.paint_range;
+            handles_input = paint.start.input_handlers_index != paint.end.input_handlers_index;
             Decision::Bypass
         }
         Some(record)
@@ -284,7 +323,8 @@ pub(crate) fn decide(
             Decision::Repaint
         }
         None if streak >= PROMOTE_AFTER_SCROLLED_FRAMES
-            && policy.retry_at.is_none_or(|at| frame >= at) =>
+            && retry_at.is_none_or(|at| frame >= at)
+            && !policy.surfaces_without_layer =>
         {
             Decision::Repaint
         }
@@ -297,12 +337,18 @@ pub(crate) fn decide(
         .unwrap_or_default();
     if changed {
         history |= 1;
-        demote |= !replayed && history.count_ones() >= DEMOTE_AFTER_CHANGED_FRAMES;
+        let changed_frames = if replayed {
+            LIST_DEMOTE_AFTER_CHANGED_FRAMES
+        } else {
+            DEMOTE_AFTER_CHANGED_FRAMES
+        };
+        demote |= history.count_ones() >= changed_frames;
     }
     let decision = if demote { Decision::Bypass } else { decision };
 
     let starting_cache = decision == Decision::Repaint && layer.record.is_none();
     let owner = invalidate::owner_view(window);
+    let surfaces_placed = crate::fast::composition::surfaces_placed(window);
     let layer = window.fast_layers.layers.get_mut(id).unwrap();
     layer.rows.rerendered = rerendered && decision == Decision::Composite;
     let policy = &mut layer.policy;
@@ -315,10 +361,16 @@ pub(crate) fn decide(
         policy.last_scrolled_frame = Some(frame);
     }
     policy.last_seen_frame = frame;
+    policy.surfaces_placed = surfaces_placed;
     policy.last_offset = Some(scroll_offset);
     policy.last_decision = Some(decision);
     policy.change_history = history;
     policy.demoted_until = demoted_until;
+    if unfocused {
+        policy.retry_at = None;
+        policy.retry_doublings = 0;
+        policy.retry_focus = None;
+    }
     if starting_cache {
         policy.work = WorkBudget::default();
     }
@@ -353,7 +405,10 @@ pub(crate) fn decide(
         layer.record = None;
         policy.painted_in = None;
         if ineligible {
-            policy.retry_at = Some(frame + RETRY_AFTER_INELIGIBLE_FRAMES);
+            policy.retry_at =
+                Some(frame + (RETRY_AFTER_INELIGIBLE_FRAMES << policy.retry_doublings));
+            policy.retry_doublings = (policy.retry_doublings + 1).min(MAX_COOLDOWN_DOUBLINGS);
+            policy.retry_focus = if handles_input { focus } else { None };
         }
         return decision;
     }
@@ -362,7 +417,11 @@ pub(crate) fn decide(
             policy.painted_in = Some(context);
             layer.last_composited_frame = frame;
         }
-        Decision::Composite => layer.last_composited_frame = frame,
+        Decision::Composite => {
+            layer.last_composited_frame = frame;
+            policy.retry_doublings = 0;
+            policy.retry_focus = None;
+        }
         Decision::Bypass => {}
     }
     decision
@@ -399,6 +458,40 @@ pub(crate) fn note_unchanged_repaint(window: &mut Window, id: &GlobalElementId) 
     }
 }
 
+/// Notes that the content of the container `id`, prepainted into its layer
+/// since the container was looked at, placed a native or external GPU
+/// surface (a web view), if it did. A composited frame does not prepaint the
+/// content and would leave the surface where it was, so the container is
+/// kept off its layer as for an anchored element.
+pub(crate) fn note_surfaces_placed(window: &mut Window, id: &GlobalElementId) {
+    let placed = crate::fast::composition::surfaces_placed(window);
+    let layers = &mut window.fast_layers;
+    if layers
+        .layers
+        .get(id)
+        .is_some_and(|layer| layer.policy.surfaces_placed != placed)
+    {
+        layers.scrolls.anchored.push(id.clone());
+    }
+}
+
+/// Notes whether the content of the container `id`, prepainted without its
+/// layer since the container was looked at this frame, placed a native or
+/// external GPU surface. Called where such a prepaint ends; the container
+/// is not promoted while its content holds one (see
+/// [`LayerPolicy::surfaces_without_layer`]).
+pub(crate) fn note_surfaces_without_layer(window: &mut Window, id: &GlobalElementId) {
+    let placed = crate::fast::composition::surfaces_placed(window);
+    let frame = window.fast_layers.frame;
+    if let Some(layer) = window.fast_layers.layers.get_mut(id)
+        && layer.record.is_none()
+        && layer.policy.last_seen_frame == frame
+        && layer.policy.last_decision == Some(Decision::Bypass)
+    {
+        layer.policy.surfaces_without_layer = layer.policy.surfaces_placed != placed;
+    }
+}
+
 /// Records work completed for the layer in this frame. One unit is the
 /// work of drawing its visible content directly; overscan and rows rebuilt
 /// for hover count too. The next prepaint can fall back before doing more.
@@ -431,9 +524,9 @@ fn fits(window: &Window, record: &LayerRecord) -> bool {
 
 /// Whether the content `record` holds of the scroll container `id` can be
 /// composited from a layer this frame (spec §5.6, §6.5): it deferred no
-/// draws (anchored popovers), placed no anchored element, handles no text
-/// input (a focused input is inside), and nothing in it asked for an
-/// animation frame.
+/// draws (anchored popovers), placed no anchored element or native surface,
+/// handles no text input (a focused input is inside), and nothing in it
+/// asked for an animation frame.
 fn eligible(
     window: &Window,
     id: &GlobalElementId,
@@ -483,9 +576,16 @@ pub(crate) fn finish_frame(layers: &mut WindowLayers) {
 
 /// Whether the layer is kept at the end of `frame`: it was composited
 /// lately, or it is demoted and remembers until when. Keep the lightweight
-/// policy briefly after cooldown too, so re-promotion does not lose backoff.
+/// policy briefly after cooldown too, so re-promotion does not lose backoff,
+/// and while content that keeps holding what a layer cannot composite waits
+/// longer than a layer not composited is kept for.
 pub(crate) fn keep(layer: &Layer, frame: u64) -> bool {
     frame < layer.last_composited_frame + DROP_AFTER_FRAMES
+        || (layer.policy.retry_doublings > 0
+            && layer
+                .policy
+                .retry_at
+                .is_some_and(|at| frame < at.saturating_add(DROP_AFTER_FRAMES)))
         || (layer.policy.cooldown_doublings > 0
             && frame
                 < layer

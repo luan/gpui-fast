@@ -342,6 +342,18 @@ impl WgpuContext {
         }
     }
 
+    pub fn supports_transient_attachments(&self) -> bool {
+        #[cfg(target_family = "wasm")]
+        if self.backend == WgpuBackend::BrowserWebGpu {
+            // wgpu passes usage bits straight to the browser without knowing
+            // whether it recognizes this one.
+            return js_sys::Reflect::get(&js_sys::global(), &"GPUTextureUsage".into())
+                .and_then(|usage| js_sys::Reflect::has(&usage, &"TRANSIENT_ATTACHMENT".into()))
+                .unwrap_or(false);
+        }
+        true
+    }
+
     #[cfg(target_family = "wasm")]
     pub async fn new_web(
         canvas: &web_sys::HtmlCanvasElement,
@@ -456,9 +468,7 @@ impl WgpuContext {
                 .using_alignment(adapter.limits())
         };
         #[cfg(not(target_family = "wasm"))]
-        let required_limits = wgpu::Limits::downlevel_defaults()
-            .using_resolution(adapter.limits())
-            .using_alignment(adapter.limits());
+        let required_limits = crate::fast::native_gl::required_limits(adapter);
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -732,6 +742,7 @@ impl WgpuContext {
 
     pub fn uses_webgl_instance_data(&self) -> bool {
         matches!(self.backend, WgpuBackend::Gl) && cfg!(target_family = "wasm")
+            || crate::fast::native_gl::uses_texture_instance_data(&self.adapter)
     }
 
     pub fn supports_dual_source_blending(&self) -> bool {

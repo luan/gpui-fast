@@ -1062,6 +1062,8 @@ impl X11Client {
                     .context("X11: Failed to handle property notify")
                     .log_err();
             }
+            Event::FocusIn(event) | Event::FocusOut(event)
+                if crate::fast::x11_focus::is_inferior(event.detail) => {}
             Event::FocusIn(event) => {
                 let window = self.get_window(event.event)?;
                 window.set_active(true);
@@ -2376,7 +2378,7 @@ fn check_compositor_present(xcb_connection: &XCBConnection, root: xproto::Window
         method3
     );
 
-    method1 || method2 || method3
+    crate::fast::x11_compositor::compositor_present(xcb_connection, root)
 }
 
 fn check_gtk_frame_extents_supported(

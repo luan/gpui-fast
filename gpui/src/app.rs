@@ -26,7 +26,7 @@ pub use bench_context::{
     BenchAppContext, BenchMeasurement, BenchReport, BenchWindowContext, CountingAllocator,
     MetricReport, bench_platform,
 };
-use collections::{FxHashMap, FxHashSet, HashMap, TypeIdHashMap, TypeIdHashSet, VecDeque};
+use collections::{FxHashMap, FxHashSet, HashMap, TypeIdHashMap, VecDeque};
 pub use context::*;
 pub use entity_map::*;
 use gpui_util::{ResultExt, debug_panic};
@@ -56,8 +56,8 @@ use crate::{
     PromptButton, PromptHandle, PromptLevel, Render, RenderImage, RenderablePromptHandle,
     Reservation, ScreenCaptureSource, SharedString, SubscriberSet, Subscription, SvgRenderer,
     SystemNotification, SystemNotificationResponse, Task, TextRenderingMode, TextSystem,
-    ThermalState, Window, WindowAppearance, WindowButtonLayout, WindowHandle, WindowId,
-    WindowInvalidator, WindowingRequest,
+    ThermalState, Window, WindowAppearance, WindowBounds, WindowButtonLayout, WindowHandle,
+    WindowId, WindowInvalidator, WindowingRequest,
     colors::{Colors, GlobalColors},
     hash, init_app_menus,
 };
@@ -84,7 +84,7 @@ pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(200);
 /// Strongly consider removing after stabilization.
 #[doc(hidden)]
 pub struct AppCell {
-    app: RefCell<App>,
+    pub(crate) app: RefCell<App>,
     borrow_origin: Cell<Option<(&'static std::panic::Location<'static>, &'static str)>>,
 }
 
@@ -317,6 +317,7 @@ impl Application {
         let this = self.0.clone();
         let platform = self.0.borrow().platform.clone();
         platform.run(Box::new(move || {
+            crate::fast::app_borrow::track_app(&this);
             let cx = &mut *this.borrow_mut();
             // Some platforms only connect to their display server in `run`.
             cx.displays_changed();
@@ -345,6 +346,7 @@ impl Application {
         let this = self.0.clone();
         let platform = self.0.borrow().platform.clone();
         platform.run(Box::new(move || {
+            crate::fast::app_borrow::track_app(&this);
             let cx = &mut *this.borrow_mut();
             // Some platforms only connect to their display server in `run`.
             cx.displays_changed();
@@ -908,7 +910,7 @@ pub struct App {
         TypeIdHashMap<Vec<Rc<dyn Fn(&dyn Any, DispatchPhase, &mut Self)>>>,
     pending_effects: VecDeque<Effect>,
 
-    pub(crate) observers: SubscriberSet<EntityId, Handler>,
+    pub(crate) observers: SubscriberSet<EntityId, crate::fast::observers::Observer>,
     pub(crate) event_listeners: SubscriberSet<EntityId, (TypeId, Listener)>,
     pub(crate) keystroke_observers: SingleSubscriberSet<KeystrokeObserver>,
     pub(crate) keystroke_interceptors: SingleSubscriberSet<KeystrokeObserver>,
@@ -924,7 +926,7 @@ pub struct App {
     app_lifecycle_observers: SingleSubscriberSet<AppLifecycleHandler>,
     memory_warning_observers: SingleSubscriberSet<Handler>,
     pub(crate) release_listeners: SubscriberSet<EntityId, ReleaseListener>,
-    pub(crate) global_observers: SubscriberSet<TypeId, Handler>,
+    pub(crate) global_observers: SubscriberSet<TypeId, crate::fast::observers::Observer>,
     pub(crate) quit_observers: SingleSubscriberSet<QuitHandler>,
     pub(crate) restart_observers: SingleSubscriberSet<Handler>,
     pub(crate) window_closed_observers: SingleSubscriberSet<WindowClosedHandler>,
@@ -953,8 +955,8 @@ pub struct App {
     http_client: Arc<dyn HttpClient>,
 
     // below is plain data, the drop order is insignificant here
-    pub(crate) pending_notifications: FxHashSet<EntityId>,
-    pub(crate) pending_global_notifications: TypeIdHashSet,
+    pub(crate) pending_notifications: crate::fast::observers::EntityNotices,
+    pub(crate) pending_global_notifications: crate::fast::observers::GlobalNotices,
     pub(crate) dependencies: crate::fast::dependencies::AppDependencies,
     pub(crate) restart_path: Option<PathBuf>,
     pub(crate) restart_arguments: Vec<OsString>,
@@ -973,7 +975,7 @@ pub struct App {
     pub(crate) name: Option<&'static str>,
     pub(crate) text_rendering_mode: Rc<Cell<TextRenderingMode>>,
 
-    pub(crate) window_update_stack: Vec<WindowId>,
+    pub(crate) window_update_stack: Vec<WindowUpdateEntry>,
     pub(crate) mode: GpuiMode,
     pub(crate) cursor_hide_mode: CursorHideMode,
     pub(crate) reduce_motion: bool,
@@ -993,8 +995,14 @@ pub struct App {
     _ref_counts: Arc<RwLock<EntityRefCounts>>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct WindowUpdateEntry {
+    window_id: WindowId,
+    bounds: WindowBounds,
+    display_id: Option<DisplayId>,
+}
+
 impl App {
-    #[allow(clippy::new_ret_no_self)]
     pub(crate) fn new_app(
         platform: Rc<dyn Platform>,
         asset_source: Arc<dyn AssetSource>,
@@ -1053,8 +1061,8 @@ impl App {
                 keyboard_mapper,
                 global_action_listeners: Default::default(),
                 pending_effects: VecDeque::new(),
-                pending_notifications: FxHashSet::default(),
-                pending_global_notifications: Default::default(),
+                pending_notifications: crate::fast::observers::EntityNotices::default(),
+                pending_global_notifications: crate::fast::observers::GlobalNotices::default(),
                 dependencies: crate::fast::dependencies::AppDependencies::default(),
                 observers: SubscriberSet::new(),
                 tracked_entities: FxHashMap::default(),
@@ -1144,11 +1152,22 @@ impl App {
             }
         }));
 
+        let fast_power = crate::fast::misc::system_power::PowerNotifications::new(
+            platform.foreground_executor(),
+        );
         platform.on_system_sleep(Box::new({
             let app = Rc::downgrade(&app);
+            let fast_power = Rc::clone(&fast_power);
             move || {
                 if let Some(app) = app.upgrade() {
-                    let cx = &mut app.borrow_mut();
+                    let Some(cx) =
+                        &mut crate::fast::misc::system_power::PowerNotifications::borrow_for_sleep(
+                            &fast_power,
+                            &app,
+                        )
+                    else {
+                        return;
+                    };
                     cx.system_sleep_observers
                         .clone()
                         .retain(move |callback| (callback)(cx));
@@ -1160,7 +1179,14 @@ impl App {
             let app = Rc::downgrade(&app);
             move || {
                 if let Some(app) = app.upgrade() {
-                    let cx = &mut app.borrow_mut();
+                    let Some(cx) =
+                        &mut crate::fast::misc::system_power::PowerNotifications::borrow_for_wake(
+                            &fast_power,
+                            &app,
+                        )
+                    else {
+                        return;
+                    };
                     cx.system_wake_observers
                         .clone()
                         .retain(move |callback| (callback)(cx));
@@ -1483,8 +1509,7 @@ impl App {
     }
 
     pub(crate) fn new_observer(&mut self, key: EntityId, value: Handler) -> Subscription {
-        let (subscription, activate) = self.observers.insert_pending(key, value);
-        self.defer(move |_| activate());
+        let subscription = crate::fast::observers::observe_entity(self, key, value);
         subscription
     }
 
@@ -1587,6 +1612,40 @@ impl App {
         self.platform.active_window()
     }
 
+    /// Returns the display containing the window that is currently focused at the platform level.
+    pub fn active_display(&self) -> Option<Rc<dyn PlatformDisplay>> {
+        let (display_id, _) = self.active_window_placement()?;
+        self.find_display(display_id?)
+    }
+
+    pub(crate) fn active_window_placement(&self) -> Option<(Option<DisplayId>, WindowBounds)> {
+        let window_id = self.active_window()?.window_id();
+
+        if let Some(state) = self
+            .window_update_stack
+            .iter()
+            .rev()
+            .find(|state| state.window_id == window_id)
+        {
+            return Some((state.display_id, state.bounds));
+        }
+
+        let window = self.windows.get(window_id)?.as_ref()?;
+        Some((window.display_id(), window.last_window_bounds()))
+    }
+
+    pub(crate) fn sync_window_update_entry(&mut self, window: &Window) {
+        if let Some(state) = self
+            .window_update_stack
+            .iter_mut()
+            .rev()
+            .find(|state| state.window_id == window.handle.id)
+        {
+            state.bounds = window.last_window_bounds();
+            state.display_id = window.display_id();
+        }
+    }
+
     /// Opens a new window with the given option and the root view returned by the given function.
     /// The function is invoked with a `Window`, which can be used to interact with window-specific
     /// functionality.
@@ -1600,7 +1659,11 @@ impl App {
             let handle = WindowHandle::new(id);
             match Window::new(handle.into(), options, cx) {
                 Ok(mut window) => {
-                    cx.window_update_stack.push(id);
+                    cx.window_update_stack.push(WindowUpdateEntry {
+                        window_id: id,
+                        bounds: window.last_window_bounds(),
+                        display_id: window.display_id(),
+                    });
                     let root_view = build_root_view(&mut window, cx);
                     cx.window_update_stack.pop();
                     window.root.replace(root_view.into());
@@ -1673,6 +1736,66 @@ impl App {
             .iter()
             .find(|display| display.id() == id)
             .cloned()
+    }
+
+    /// Returns a diagnostic snapshot of app, display, and window state.
+    ///
+    /// This is for inspecting a running app that is misbehaving in a way that
+    /// is hard to reproduce. The layout is not stable and varies by platform;
+    /// do not parse it for program logic. A window that is being updated when
+    /// this is called is listed by ID only.
+    pub fn debug_state(&self) -> serde_json::Value {
+        let displays = self
+            .platform
+            .displays()
+            .into_iter()
+            .map(|display| {
+                serde_json::json!({
+                    "id": u64::from(display.id()),
+                    "uuid": display.uuid().ok().map(|uuid| uuid.to_string()),
+                    "bounds": display.bounds(),
+                    "visible_bounds": display.visible_bounds(),
+                    "refresh_interval_seconds": display
+                        .refresh_interval()
+                        .map(|interval| interval.as_secs_f64()),
+                })
+            })
+            .collect::<Vec<_>>();
+        let windows = self
+            .windows
+            .iter()
+            .map(|(window_id, window)| match window {
+                Some(window) => window.debug_state(),
+                None => serde_json::json!({ "id": window_id.as_u64(), "updating": true }),
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "compositor": self.platform.compositor_name(),
+            "thermal_state": format!("{:?}", self.platform.thermal_state()),
+            "power_mode": {
+                "cached": format!("{:?}", self.power_mode),
+                "platform": format!("{:?}", self.platform.power_mode()),
+            },
+            "window_appearance": format!("{:?}", self.platform.window_appearance()),
+            "cursor_visible": self.platform.is_cursor_visible(),
+            "active_window_id": self
+                .platform
+                .active_window()
+                .map(|handle| handle.window_id().as_u64()),
+            "window_stack": self.platform.window_stack().map(|stack| {
+                stack
+                    .into_iter()
+                    .map(|handle| handle.window_id().as_u64())
+                    .collect::<Vec<_>>()
+            }),
+            "primary_display_id": self
+                .platform
+                .primary_display()
+                .map(|display| u64::from(display.id())),
+            "displays": displays,
+            "windows": windows,
+            "platform": self.platform.debug_state(),
+        })
     }
 
     /// Returns the current thermal state of the system.
@@ -1968,8 +2091,11 @@ impl App {
     ///
     /// Best-effort: some platforms cannot retract a notification once shown,
     /// in which case it ages out of the notification center on its own.
-    pub fn dismiss_system_notification(&self, tag: &str) {
-        self.platform.dismiss_system_notification(tag);
+    /// The task completes after the platform calls return, not after any
+    /// asynchronous work inside the operating system. Dropping it does not
+    /// cancel dismissal.
+    pub fn dismiss_system_notification(&self, tag: &str) -> Task<()> {
+        self.platform.dismiss_system_notification(tag)
     }
 
     /// Registers the handler invoked when the user activates a system
@@ -2105,13 +2231,13 @@ impl App {
     pub(crate) fn push_effect(&mut self, effect: Effect) {
         match &effect {
             Effect::Notify { emitter } => {
-                if !self.pending_notifications.insert(*emitter) {
+                if !crate::fast::observers::note_entity_change(self, *emitter) {
                     return;
                 }
             }
             Effect::NotifyGlobalObservers { global_type } => {
                 crate::fast::dependencies::global_changed(self, *global_type);
-                if !self.pending_global_notifications.insert(*global_type) {
+                if !crate::fast::observers::note_global_change(self, *global_type) {
                     return;
                 }
             }
@@ -2250,11 +2376,11 @@ impl App {
     }
 
     fn apply_notify_effect(&mut self, emitter: EntityId) {
-        self.pending_notifications.remove(&emitter);
+        let fast_told = crate::fast::observers::take_entity_notice(self, emitter);
 
-        self.observers
-            .clone()
-            .retain(&emitter, |handler| handler(self));
+        self.observers.clone().retain(&emitter, |observer| {
+            crate::fast::observers::tell(observer, fast_told, self)
+        });
     }
 
     fn apply_emit_effect(&mut self, emitter: EntityId, event_type: TypeId, event: &dyn Any) {
@@ -2279,10 +2405,10 @@ impl App {
     }
 
     fn apply_notify_global_observers_effect(&mut self, type_id: TypeId) {
-        self.pending_global_notifications.remove(&type_id);
-        self.global_observers
-            .clone()
-            .retain(&type_id, |observer| observer(self));
+        let fast_told = crate::fast::observers::take_global_notice(self, type_id);
+        self.global_observers.clone().retain(&type_id, |observer| {
+            crate::fast::observers::tell(observer, fast_told, self)
+        });
     }
 
     fn apply_defer_effect(&mut self, callback: Box<dyn FnOnce(&mut Self) + 'static>) {
@@ -2598,14 +2724,14 @@ impl App {
         &mut self,
         mut f: impl FnMut(&mut Self) + 'static,
     ) -> Subscription {
-        let (subscription, activate) = self.global_observers.insert_pending(
+        let subscription = crate::fast::observers::observe_global(
+            self,
             TypeId::of::<G>(),
             Box::new(move |cx| {
                 f(cx);
                 true
             }),
         );
-        self.defer(move |_| activate());
         subscription
     }
 
@@ -3181,7 +3307,7 @@ impl App {
             .collect();
 
         if live_invalidators.is_empty() {
-            if self.pending_notifications.insert(entity_id) {
+            if crate::fast::observers::note_entity_change(self, entity_id) {
                 self.pending_effects
                     .push_back(Effect::Notify { emitter: entity_id });
             }
@@ -3260,7 +3386,11 @@ impl App {
 
             let root_view = window.root.clone().unwrap();
 
-            cx.window_update_stack.push(window.handle.id);
+            cx.window_update_stack.push(WindowUpdateEntry {
+                window_id: window.handle.id,
+                bounds: window.last_window_bounds(),
+                display_id: window.display_id(),
+            });
             update(Some((root_view, &mut window, cx)));
             fn trail(window_id: WindowId, window: Box<Window>, cx: &mut App) -> Option<()> {
                 cx.window_update_stack.pop();
@@ -3345,7 +3475,7 @@ impl AppContext for App {
             cx.push_effect(Effect::EntityCreated {
                 entity: handle.into_any(),
                 tid: TypeId::of::<T>(),
-                window: cx.window_update_stack.last().cloned(),
+                window: cx.window_update_stack.last().map(|state| state.window_id),
             });
 
             cx.entities.insert(slot, entity)

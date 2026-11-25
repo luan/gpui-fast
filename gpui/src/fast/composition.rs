@@ -490,6 +490,7 @@ impl Scene {
             && self.subpixel_sprites.is_empty()
             && self.polychrome_sprites.is_empty()
             && self.surfaces.is_empty()
+            && self.native_views.is_empty()
     }
 
     /// Replays a range as a self-contained scene, restoring any layers that
@@ -610,6 +611,23 @@ fn begin_input(window: &mut Window, overlay: bool) {
 
 pub(crate) fn input_surface(window: &Window) -> Option<CompositionSurfaceId> {
     window.next_frame.fast_composition_input.scope
+}
+
+/// How many times an element placed a native or external GPU surface while
+/// `window` prepainted, as a web view does from its prepaint: content that
+/// placed one between two counts must be prepainted for it to stay in place.
+/// An element hosting a surface sets its bounds each time it is prepainted,
+/// as it inserts its hitbox, and not from paint, where its surface would not
+/// be stacked with its host either.
+pub(crate) fn surfaces_placed(window: &Window) -> u64 {
+    window.fast_composition.0.borrow().placements.get()
+}
+
+/// Native views move with their GPUI elements each frame, like composition
+/// surfaces. A scrolling container must keep prepainting their placements.
+pub(crate) fn note_native_view_placement(window: &Window) {
+    let state = window.fast_composition.0.borrow();
+    state.placements.set(state.placements.get() + 1);
 }
 
 pub(crate) fn record_input(window: &mut Window, id: HitboxId) {
@@ -745,6 +763,9 @@ pub(crate) struct WindowCompositionState {
     geometry_dirty: Rc<Cell<bool>>,
     /// What the window is prepainting, while it prepaints a frame.
     prepainting: Rc<Cell<Option<Host>>>,
+    /// How many times a platform surface was placed while the window
+    /// prepainted. See [`surfaces_placed`].
+    placements: Rc<Cell<u64>>,
     /// Whether [`Window::enable_window_composition`] was called; the window
     /// presents through its composition only while it also
     /// [`splits`](Self::splits).
@@ -790,6 +811,7 @@ impl Default for WindowCompositionHandle {
             overlay_surface,
             geometry_dirty: Rc::new(Cell::new(false)),
             prepainting: Rc::new(Cell::new(None)),
+            placements: Rc::new(Cell::new(0)),
             enabled: false,
             input_order: Vec::new(),
             visible: FxHashMap::default(),
@@ -810,6 +832,7 @@ struct ManagedPlatformSurface {
     visible: Rc<Cell<bool>>,
     input_forwarding: Cell<bool>,
     prepainting: Rc<Cell<Option<Host>>>,
+    placements: Rc<Cell<u64>>,
     /// The surface its host was last prepainted on.
     host: Cell<Host>,
     /// Whether `host` changed since the surface was last restacked.
@@ -828,6 +851,7 @@ impl ManagedPlatformSurface {
             visible: Rc::new(Cell::new(true)),
             input_forwarding: Cell::new(false),
             prepainting: state.prepainting.clone(),
+            placements: state.placements.clone(),
             host: Cell::new(Host::Base),
             restack: Cell::new(false),
         }
@@ -836,11 +860,14 @@ impl ManagedPlatformSurface {
 
 impl PlatformSurfaceAttachment for ManagedPlatformSurface {
     fn set_bounds(&self, bounds: Bounds<DevicePixels>) -> Result<()> {
-        if let Some(host) = self.prepainting.get()
-            && self.host.replace(host) != host
-        {
-            self.restack.set(true);
-            self.geometry_dirty.set(true);
+        if let Some(host) = self.prepainting.get() {
+            // Counted before the early return below: an element placing its
+            // surface where it already is was placed all the same.
+            self.placements.set(self.placements.get() + 1);
+            if self.host.replace(host) != host {
+                self.restack.set(true);
+                self.geometry_dirty.set(true);
+            }
         }
         if self.bounds.get() == bounds {
             return Ok(());
@@ -1292,6 +1319,55 @@ fn switch_surface(window: &mut Window, surface: CompositionSurfaceId) {
         .switch_to(surface, scene_len);
 }
 
+/// What a view built again on its own, inside a view drawn from last frame,
+/// was drawn on, put back for it by [`enter_gap`], and what [`leave_gap`]
+/// restores after it.
+pub(crate) enum GapSurface {
+    /// Nothing was put back.
+    Kept,
+    /// It is prepainted under its surface; the input scope before it.
+    Input(Option<CompositionSurfaceId>),
+    /// It is painted onto its surface; the surface before it.
+    Paint(CompositionSurfaceId),
+}
+
+/// Puts back `surface`, the surface a view was drawn on last frame, for the
+/// view built again on its own where it was. What chose it, a
+/// [`Window::with_composition_surface`] around the view, is drawn from last
+/// frame and does not run again, so the view would otherwise take its input
+/// regions and paint to whatever surface the frame is on there.
+pub(crate) fn enter_gap(window: &mut Window, surface: Option<CompositionSurfaceId>) -> GapSurface {
+    let Some(surface) = surface else {
+        return GapSurface::Kept;
+    };
+    if window.fast_layers.painting.is_some() {
+        return GapSurface::Kept;
+    }
+    if window.invalidator.inner.borrow().draw_phase == crate::window::DrawPhase::Paint {
+        let Some(previous) = window.next_frame.fast_composition_starts.current() else {
+            return GapSurface::Kept;
+        };
+        switch_surface(window, surface);
+        return GapSurface::Paint(previous);
+    }
+    GapSurface::Input(
+        window
+            .next_frame
+            .fast_composition_input
+            .scope
+            .replace(surface),
+    )
+}
+
+/// Restores what [`enter_gap`] put back.
+pub(crate) fn leave_gap(window: &mut Window, surface: GapSurface) {
+    match surface {
+        GapSurface::Kept => {}
+        GapSurface::Input(previous) => window.next_frame.fast_composition_input.scope = previous,
+        GapSurface::Paint(previous) => switch_surface(window, previous),
+    }
+}
+
 /// Stacks what the root view positions, as it prepaints, below the overlay
 /// surface.
 pub(crate) fn begin_base_prepaint(window: &mut Window) {
@@ -1697,12 +1773,11 @@ pub(crate) fn dispatch_native(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
-        CompositionSurfaceId, CompositionSurfaceKind, CompositionTree, Host,
-        ManagedPlatformSurface, PlatformSurfaceAttachment, WindowComposition,
-        WindowCompositionHandle, composed_scene_layers, ordered_plain_scene,
-        restack_native_surfaces,
+        CompositionSurfaceId, CompositionSurfaceKind, CompositionTree, ManagedPlatformSurface,
+        PlatformSurfaceAttachment, WindowComposition, WindowCompositionHandle,
+        composed_scene_layers, ordered_plain_scene, restack_native_surfaces,
     };
     use crate::{
         AppContext as _, Bounds, ContentMask, Context, DevicePixels, Entity, IntoElement,
@@ -1844,17 +1919,10 @@ mod tests {
             bounds: Cell::new(Bounds::default()),
             parent_origin: Cell::new(Point::default()),
         });
-        let geometry_dirty = Rc::new(Cell::new(false));
-        let surface = ManagedPlatformSurface {
-            platform_surface: platform_surface.clone(),
-            bounds: Cell::new(Bounds::default()),
-            geometry_dirty: geometry_dirty.clone(),
-            visible: Rc::new(Cell::new(true)),
-            input_forwarding: Cell::new(false),
-            prepainting: Rc::new(Cell::new(None)),
-            host: Cell::new(Host::Base),
-            restack: Cell::new(false),
-        };
+        let composition = WindowCompositionHandle::default();
+        let state = composition.0.borrow();
+        let geometry_dirty = state.geometry_dirty.clone();
+        let surface = ManagedPlatformSurface::new(platform_surface.clone(), &state);
         let bounds = Bounds {
             origin: Point {
                 x: DevicePixels(25),
@@ -1885,17 +1953,10 @@ mod tests {
             bounds: Cell::new(Bounds::default()),
             parent_origin: Cell::new(Point::default()),
         });
-        let dirty = Rc::new(Cell::new(false));
-        let surface = ManagedPlatformSurface {
-            platform_surface: platform.clone(),
-            bounds: Cell::new(Bounds::default()),
-            geometry_dirty: dirty.clone(),
-            visible: Rc::new(Cell::new(true)),
-            input_forwarding: Cell::new(false),
-            prepainting: Rc::new(Cell::new(None)),
-            host: Cell::new(Host::Base),
-            restack: Cell::new(false),
-        };
+        let composition = WindowCompositionHandle::default();
+        let state = composition.0.borrow();
+        let dirty = state.geometry_dirty.clone();
+        let surface = ManagedPlatformSurface::new(platform.clone(), &state);
         surface.set_bounds(bounds)?;
         dirty.set(false);
         for _ in 0..10 {
@@ -1929,17 +1990,10 @@ mod tests {
             bounds: Cell::new(Bounds::default()),
             parent_origin: Cell::new(Point::default()),
         });
-        let dirty = Rc::new(Cell::new(false));
-        let surface = ManagedPlatformSurface {
-            platform_surface: platform.clone(),
-            bounds: Cell::new(Bounds::default()),
-            geometry_dirty: dirty.clone(),
-            visible: Rc::new(Cell::new(true)),
-            input_forwarding: Cell::new(false),
-            prepainting: Rc::new(Cell::new(None)),
-            host: Cell::new(Host::Base),
-            restack: Cell::new(false),
-        };
+        let composition = WindowCompositionHandle::default();
+        let state = composition.0.borrow();
+        let dirty = state.geometry_dirty.clone();
+        let surface = ManagedPlatformSurface::new(platform.clone(), &state);
         assert!(surface.set_bounds(bounds).is_err());
         assert_eq!(surface.bounds(), Bounds::default());
         assert!(!dirty.get());
@@ -2195,6 +2249,14 @@ mod tests {
         })
     }
 
+    /// What [`WindowComposition::create_native_surface`] hands the element
+    /// hosting a native surface in `window`, without the platform view the
+    /// test platform cannot create.
+    pub(crate) fn native_surface(window: &Window) -> Rc<dyn PlatformSurfaceAttachment> {
+        let state = window.fast_composition.0.borrow();
+        Rc::new(ManagedPlatformSurface::new(test_platform_surface(), &state))
+    }
+
     /// Positions one native surface from the root view and another from a
     /// deferred draw, or both from the root view.
     struct Hosts {
@@ -2203,7 +2265,9 @@ mod tests {
         dialog_open: bool,
     }
 
-    fn native_host(surface: Rc<ManagedPlatformSurface>) -> impl IntoElement {
+    /// Places `surface` over itself as it is prepainted, as a web view does,
+    /// without clipping it.
+    pub(crate) fn native_host(surface: Rc<dyn PlatformSurfaceAttachment>) -> impl IntoElement {
         canvas(
             move |bounds, window, _| {
                 surface
@@ -2375,5 +2439,170 @@ mod tests {
             assert_eq!(ids, [base]);
         }
         assert_eq!(builds.get(), 1, "the badge is drawn again from last frame");
+    }
+
+    /// Lays what it holds onto `surface` as it is prepainted and painted, as
+    /// an application lays its interface over a native surface.
+    struct OnSurface {
+        surface: CompositionSurfaceId,
+        child: crate::AnyElement,
+    }
+
+    impl crate::Element for OnSurface {
+        type RequestLayoutState = ();
+        type PrepaintState = ();
+
+        fn id(&self) -> Option<crate::ElementId> {
+            None
+        }
+
+        fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+            None
+        }
+
+        fn request_layout(
+            &mut self,
+            _: Option<&crate::GlobalElementId>,
+            _: Option<&crate::InspectorElementId>,
+            window: &mut Window,
+            cx: &mut crate::App,
+        ) -> (crate::LayoutId, ()) {
+            (self.child.request_layout(window, cx), ())
+        }
+
+        fn prepaint(
+            &mut self,
+            _: Option<&crate::GlobalElementId>,
+            _: Option<&crate::InspectorElementId>,
+            _: Bounds<crate::Pixels>,
+            (): &mut (),
+            window: &mut Window,
+            cx: &mut crate::App,
+        ) {
+            let child = &mut self.child;
+            window
+                .with_composition_surface(self.surface, |window| child.prepaint(window, cx))
+                .unwrap();
+        }
+
+        fn paint(
+            &mut self,
+            _: Option<&crate::GlobalElementId>,
+            _: Option<&crate::InspectorElementId>,
+            _: Bounds<crate::Pixels>,
+            (): &mut (),
+            (): &mut (),
+            window: &mut Window,
+            cx: &mut crate::App,
+        ) {
+            let child = &mut self.child;
+            window
+                .with_composition_surface(self.surface, |window| child.paint(window, cx))
+                .unwrap();
+        }
+    }
+
+    /// A square that takes the pointer, counting its builds.
+    struct Button {
+        builds: Rc<Cell<usize>>,
+    }
+
+    impl Render for Button {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.builds.set(self.builds.get() + 1);
+            div()
+                .size(px(20.))
+                .bg(crate::red())
+                .cursor(crate::CursorStyle::PointingHand)
+        }
+    }
+
+    /// A native surface hosted from the root view, and the button laid over it
+    /// on the overlay surface.
+    struct Interface {
+        native: Rc<dyn PlatformSurfaceAttachment>,
+        overlay: CompositionSurfaceId,
+        button: Entity<Button>,
+        builds: Rc<Cell<usize>>,
+    }
+
+    impl Render for Interface {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.builds.set(self.builds.get() + 1);
+            div()
+                .size_full()
+                .child(native_host(self.native.clone()))
+                .child(div().absolute().top_0().left_0().child(OnSurface {
+                    surface: self.overlay,
+                    child: self.button.clone().into_any_element(),
+                }))
+        }
+    }
+
+    /// A view on the overlay surface, built again on its own inside a view
+    /// drawn from last frame, stays on the overlay surface: its pointer target
+    /// stays above the native surface under it, and so does what it paints.
+    #[crate::test]
+    fn views_built_on_their_own_keep_the_surface_around_them(cx: &mut TestAppContext) {
+        let interface_builds = Rc::new(Cell::new(0));
+        let button_builds = Rc::new(Cell::new(0));
+        let mut button = None;
+        let window = cx.add_window(|window, cx| {
+            let mut state = window.fast_composition.0.borrow_mut();
+            state.enabled = true;
+            let overlay = state.overlay_surface;
+            let id = state
+                .tree
+                .insert(CompositionSurfaceKind::Native, None)
+                .unwrap();
+            state.tree.place_below(id, overlay).unwrap();
+            let native = Rc::new(ManagedPlatformSurface::new(test_platform_surface(), &state));
+            state.platform_surfaces.insert(id, native.clone());
+            // What handing the platform its order records, bottom to top.
+            state.input_order = state.tree.flattened();
+            drop(state);
+            let entity = cx.new(|_| Button {
+                builds: button_builds.clone(),
+            });
+            button = Some(entity.clone());
+            Interface {
+                native,
+                overlay,
+                button: entity,
+                builds: interface_builds.clone(),
+            }
+        });
+        let button = button.unwrap();
+        let draw = |cx: &mut TestAppContext| {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                let overlay = window.fast_composition.0.borrow().overlay_surface;
+                let hit = super::hit_test(&window.rendered_frame, crate::point(px(10.), px(10.)))
+                    .unwrap();
+                let painted = surface_of_each_operation(window)
+                    .into_iter()
+                    .filter(|surface| *surface == overlay)
+                    .count();
+                (hit.ids.len(), painted)
+            })
+            .unwrap()
+        };
+
+        let first = draw(cx);
+        assert_eq!(
+            first,
+            (1, 1),
+            "the button takes the pointer and paints on the overlay"
+        );
+
+        button.update(cx, |_, cx| cx.notify());
+        let again = draw(cx);
+        assert_eq!(button_builds.get(), 2, "the button is built again");
+        assert_eq!(
+            interface_builds.get(),
+            1,
+            "the view around it is drawn from last frame"
+        );
+        assert_eq!(again, first, "the button keeps its surface");
     }
 }
