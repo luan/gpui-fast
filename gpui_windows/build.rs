@@ -1,22 +1,20 @@
 // Modified by Longbridge for gpui-fast.
 #![allow(clippy::disallowed_methods, reason = "build scripts are exempt")]
 
+#[path = "src/fast/fxc_host_build.rs"]
+mod fast_fxc_host;
 #[path = "src/fast/rounded_clip_shader_build.rs"]
 mod fast_rounded_clip_shader;
 
 fn main() {
     crate::fast_rounded_clip_shader::stage();
-    #[cfg(not(all(target_os = "windows", not(debug_assertions))))]
     println!("cargo:rerun-if-changed=build.rs");
-    #[cfg(target_os = "windows")]
-    {
+    if crate::fast_fxc_host::compiles_shaders() {
         // Compile HLSL shaders
-        #[cfg(not(debug_assertions))]
         compile_shaders();
     }
 }
 
-#[cfg(all(target_os = "windows", not(debug_assertions)))]
 mod shader_compilation {
     use std::{
         fs,
@@ -67,7 +65,7 @@ mod shader_compilation {
     pub fn find_latest_windows_sdk_binary(
         binary: &str,
     ) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
-        let key = windows_registry::LOCAL_MACHINE
+        let key = crate::fast_fxc_host::registry::LOCAL_MACHINE
             .open("SOFTWARE\\WOW6432Node\\Microsoft\\Microsoft SDKs\\Windows\\v10.0")?;
 
         let install_folder: String = key.get_string("InstallationFolder")?; // "C:\Program Files (x86)\Windows Kits\10\"
@@ -175,18 +173,18 @@ mod shader_compilation {
         shader_path: &str,
         target: &str,
     ) {
-        let output = Command::new(fxc_path)
+        let output = crate::fast_fxc_host::on_host(Command::new(fxc_path))
             .args([
                 "/T",
                 target,
                 "/E",
                 entry_point,
                 "/Fh",
-                output_path,
+                &crate::fast_fxc_host::path(output_path),
                 "/Vn",
                 var_name,
                 "/O3",
-                shader_path,
+                &crate::fast_fxc_host::path(shader_path),
             ])
             .output();
 
@@ -233,5 +231,4 @@ mod shader_compilation {
     }
 }
 
-#[cfg(all(target_os = "windows", not(debug_assertions)))]
 use shader_compilation::compile_shaders;
